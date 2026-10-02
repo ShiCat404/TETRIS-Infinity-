@@ -47,34 +47,38 @@ main{display:flex;flex-direction:column;align-items:center;gap:8px;padding:10px}
 .hud{font-size:14px;color:var(--mut)}
 .hud b{color:var(--fg);font-size:20px;font-variant-numeric:tabular-nums}
 canvas{background:var(--well);border:2px solid var(--line);border-radius:4px;display:block}
-.hint{max-width:420px;font-size:11px;color:var(--mut);text-align:center;line-height:1.4}
+.hint{max-width:420px;font-size:12px;color:var(--mut);text-align:center}
 button{font:inherit;font-size:20px;padding:14px 0;border-radius:10px;border:1px solid var(--line);background:var(--btn);color:var(--fg)}
 button:active{background:var(--line)}
 button:focus-visible{outline:2px solid var(--fg);outline-offset:2px}
+#soundBtn{font-size:16px;font-weight:700;padding:10px 18px;min-height:44px;touch-action:manipulation}
+#soundBtn[data-on="1"]{opacity:.8}
 </style>
 </head>
 <body>
 <main>
 <div class="hud">スコア <b id="sc">0</b></div>
+<button id="soundBtn" type="button">🔇 音をONにする</button>
 <canvas id="c"></canvas>
-<div class="hint">
-  <div>横スワイプ移動 / タップ回転 / 0.5秒長押し加速</div>
-  <div style="margin-top:2px;opacity:0.85;">※iPhone等で音が出ない場合は<b>消音モード（マナーモード）を解除</b>して画面をタップしてください</div>
-</div>
+<div class="hint">横スワイプで移動 / タップで回転 / 0.5秒長押しで加速</div>
 </main>
+
 <script>
 /* iOS/Safari: ゲーム中のブラウザUIジェスチャーを極力抑止 */
 (()=>{
   const block = e => e.preventDefault();
 
+  // 長押しのコンテキストメニュー、文字選択、ドラッグを無効化
   ["contextmenu","selectstart","dragstart"].forEach(type=>{
     document.addEventListener(type, block, {passive:false});
   });
 
+  // Safariのピンチズーム等のジェスチャーイベントを無効化
   ["gesturestart","gesturechange","gestureend"].forEach(type=>{
     document.addEventListener(type, block, {passive:false});
   });
 
+  // ダブルタップによるズームを抑止（ゲーム操作側のpointer系イベントは維持）
   let lastTap = 0;
   document.addEventListener("touchend", e=>{
     const now = performance.now();
@@ -82,224 +86,27 @@ button:focus-visible{outline:2px solid var(--fg);outline-offset:2px}
     lastTap = now;
   }, {passive:false});
 
+  // iOS Safariでのスクロール/バウンスを抑止
   document.addEventListener("touchmove", e=>{
     e.preventDefault();
   }, {passive:false});
 
+  // ホイール系のスクロールも念のため抑止
   document.addEventListener("wheel", block, {passive:false});
 })();
 
 const W=14,VR=34,GAP=14,KEEP=90,A=40,V0=1/.85,V1=1/.15;
 const COL=["#4cc9f0","#f9c74f","#b388eb","#90be6d","#f94144","#4d7cff","#f8961e"];
 const SH=[
-[[0,0,0,0],[1,1,1,1],[0,0,0,0],[0,0,0,0]],
-[[1,1],[1,1]],
-[[0,1,0],[1,1,1],[0,0,0]],
-[[0,1,1],[1,1,0],[0,0,0]],
-[[1,1,0],[0,1,1],[0,0,0]],
-[[1,0,0],[1,1,1],[0,0,0]],
-[[0,0,1],[1,1,1],[0,0,0]]];
+  [[0,0,0,0],[1,1,1,1],[0,0,0,0],[0,0,0,0]],
+  [[1,1],[1,1]],
+  [[0,1,0],[1,1,1],[0,0,0]],
+  [[0,1,1],[1,1,0],[0,0,0]],
+  [[1,1,0],[0,1,1],[0,0,0]],
+  [[1,0,0],[1,1,1],[0,0,0]],
+  [[0,0,1],[1,1,1],[0,0,0]]
+];
+
 const cv=document.getElementById("c"),g=cv.getContext("2d");
-let cell,rows=[],p=null,cam=VR,lines=0,score=0,lt=0,spd=V0,acc=0,last=0,soft=false,phase="play",flash=null,ft=0,anim=null,cc=0,ch=new Array(W).fill(false),gen=0,zl=0,zm=[1,3];
 
-function size(){
-  cell=Math.max(8,Math.min(30,Math.floor(Math.min(innerWidth-20,460)/W),Math.floor((innerHeight-95)/VR)));
-  const d=devicePixelRatio||1;
-  cv.style.width=cell*W+"px";cv.style.height=cell*VR+"px";
-  cv.width=cell*W*d;cv.height=cell*VR*d;
-  g.setTransform(d,0,0,d,0,0);
-}
-addEventListener("resize",size);size();
-
-/* ----- iOS Safari Web Audio API 完全対応版アンロック処理 ----- */
-let ac=null;
-
-function getAudioContext(){
-  if(ac) return ac;
-  try{
-    const Ctx=window.AudioContext||window.webkitAudioContext;
-    if(Ctx) ac=new Ctx({latencyHint:"interactive"});
-  }catch(e){
-    try{
-      const Ctx=window.AudioContext||window.webkitAudioContext;
-      if(Ctx) ac=new Ctx();
-    }catch(_){}
-  }
-  return ac;
-}
-
-// タップ/タッチの直下で必ず同期的にResume＆ダミー再生を行う
-function unlockAudioDirect(){
-  const a=getAudioContext();
-  if(!a) return;
-
-  if(a.state === "suspended" || a.state === "interrupted"){
-    a.resume().catch(()=>{});
-  }
-
-  // 無音ダミーノードを発音させてiOSのAudioスタックを確実にアクティブ化
-  try{
-    const buf = a.createBuffer(1, 1, a.sampleRate);
-    const src = a.createBufferSource();
-    src.buffer = buf;
-    src.connect(a.destination);
-    src.start(0);
-  }catch(e){}
-}
-
-["touchstart","touchend","pointerdown","pointerup","click","keydown"].forEach(type=>{
-  addEventListener(type, unlockAudioDirect, {passive:true, capture:true});
-});
-
-addEventListener("pageshow", unlockAudioDirect);
-addEventListener("focus", unlockAudioDirect);
-document.addEventListener("visibilitychange", ()=>{ if(!document.hidden) unlockAudioDirect(); });
-
-function thud(){
-  const a=getAudioContext();
-  if(!a) return;
-  if(a.state !== "running"){
-    a.resume().catch(()=>{});
-  }
-  try{
-    const t=a.currentTime, len=Math.floor(a.sampleRate*.28);
-    const b=a.createBuffer(1,len,a.sampleRate), d=b.getChannelData(0);
-    for(let i=0;i<len;i++){
-      const e=Math.exp(-i/len*5.5);
-      d[i]=(Math.random()*2-1)*e*(.55+.45*Math.random());
-    }
-    const n=a.createBufferSource(); n.buffer=b;
-    const bp=a.createBiquadFilter(); bp.type="bandpass"; bp.frequency.value=1800; bp.Q.value=.6;
-    const lp=a.createBiquadFilter(); lp.type="lowpass"; lp.frequency.value=4200;
-    const g1=a.createGain();
-    g1.gain.setValueAtTime(0,t);
-    g1.gain.linearRampToValueAtTime(.16,t+.012);
-    g1.gain.exponentialRampToValueAtTime(.001,t+.28);
-    n.connect(bp); bp.connect(lp); lp.connect(g1); g1.connect(a.destination);
-    n.start(t);
-
-    const o=a.createOscillator(), g2=a.createGain();
-    o.frequency.setValueAtTime(150,t);
-    o.frequency.exponentialRampToValueAtTime(85,t+.1);
-    g2.gain.setValueAtTime(.05,t);
-    g2.gain.exponentialRampToValueAtTime(.001,t+.12);
-    o.connect(g2); g2.connect(a.destination);
-    o.start(t); o.stop(t+.13);
-  }catch(e){}
-}
-
-function fan(step){
-  const a=getAudioContext();
-  if(!a) return;
-  if(a.state !== "running"){
-    a.resume().catch(()=>{});
-  }
-  try{
-    const t=a.currentTime, r=Math.pow(2,Math.min(step,12)/12);
-    const out=a.createGain(), lp=a.createBiquadFilter(), dl=a.createDelay(), fb=a.createGain();
-    lp.type="lowpass"; lp.frequency.setValueAtTime(700,t);
-    lp.frequency.exponentialRampToValueAtTime(2200,t+.5);
-    lp.frequency.exponentialRampToValueAtTime(900,t+1.3);
-    dl.delayTime.value=.14; fb.gain.value=.35;
-    out.connect(lp); lp.connect(a.destination); lp.connect(dl); dl.connect(fb); fb.connect(dl); dl.connect(a.destination);
-
-    [[98,.055],[196,.06],[246.9,.045],[293.7,.045],[392,.04]].forEach(([f,v])=>{
-      [["sine",1,1],["triangle",1.004,.5]].forEach(([ty,dtn,k])=>{
-        const o=a.createOscillator(), gn=a.createGain();
-        o.type=ty;
-        o.frequency.setValueAtTime(f*r*dtn*.97,t);
-        o.frequency.exponentialRampToValueAtTime(f*r*dtn,t+.2);
-        gn.gain.setValueAtTime(0,t);
-        gn.gain.linearRampToValueAtTime(v*k,t+.06);
-        gn.gain.exponentialRampToValueAtTime(.001,t+1.4);
-        o.connect(gn); gn.connect(out);
-        o.start(t); o.stop(t+1.45);
-      });
-    });
-  }catch(e){}
-}
-
-function genRow(){let gap=null;
- if(gen>=2&&zl--<=0){zl=5+Math.floor(Math.random()*8);const r=Math.random();zm=r<.25?[4,6]:r<.85?[2,4]:[1,3]}
- for(let k=0;k<100&&!gap;k++){
-  const big=gen<2,n0=big?(gen?3:5)+Math.floor(Math.random()*3):zm[0]+Math.floor(Math.random()*(zm[1]-zm[0]+1)),n=Math.max(1,n0-(k>>4)),runs=big||n>=4?[Math.ceil(n/2),Math.floor(n/2)]:n>1&&Math.random()<.3?[1,n-1]:[n],cand=new Array(W).fill(false);let ok=true;
-  for(const w of runs){const st=Math.floor(Math.random()*(W-w+1));
-   for(let x=st-1;x<=st+w;x++)if(cand[x])ok=false;
-   for(let x=st;x<st+w;x++)cand[x]=true}
-  if(ok&&!cand.some((v,x)=>v&&ch[x]))gap=cand}
- if(!gap){gap=new Array(W).fill(false);let x;do{x=Math.floor(Math.random()*W)}while(ch[x]);gap[x]=true}
- ch=gap;gen++;return gap.map(v=>v?0:1+Math.floor(Math.random()*7))}
-function hit(m,px,py){for(let r=0;r<m.length;r++)for(let c=0;c<m.length;c++){if(!m[r][c])continue;
- const x=px+c,y=py-r;if(x<0||x>=W||y<0)return true;if(rows[y]&&rows[y][x])return true}return false}
-function spawn(){const n=KEEP-rows.length;for(let i=0;i<n;i++)rows.unshift(genRow());if(n>0)cam+=n;
- const i=Math.floor(Math.random()*7),m=SH[i];
- p={i,m,x:Math.floor((W-m.length)/2),y:rows.length+GAP};phase="play";acc=0;lt=0;cc=0}
-function rot(){if(!p)return;const m=p.m,n=m.length,r=m.map((_,y)=>m.map((_,x)=>m[n-1-x][y]));
- for(const k of [0,-1,1,-2,2])if(!hit(r,p.x+k,p.y)){p.m=r;p.x+=k;return}}
-function move(d){if(p&&!hit(p.m,p.x+d,p.y))p.x+=d}
-function check(){const f=[];rows.forEach((r,y)=>{if(r.every(v=>v))f.push(y)});
- if(f.length){cc++;fan(cc-1);phase="flash";flash=f;ft=0}else spawn()}
-function lock(){thud();const m=p.m;
- for(let r=0;r<m.length;r++)for(let c=0;c<m.length;c++)if(m[r][c]){const y=p.y-r;
-  while(rows.length<=y)rows.push(new Array(W).fill(0));rows[y][p.x+c]=-(p.i+1)}
- p=null;check()}
-function collapse(){const del=new Set(flash),nr=[],fr=[];
- for(let y=0;y<rows.length;y++){if(del.has(y))continue;nr.push(rows[y].slice());fr.push(rows[y].map(()=>y))}
- if(cc<20)for(let x=0;x<W;x++)for(let y=1;y<nr.length;y++)if(nr[y][x]<0){let t=y;while(t>0&&!nr[t-1][x])t--;
-  if(t!==y){nr[t][x]=nr[y][x];nr[y][x]=0;fr[t][x]=fr[y][x]}}
- const mv=[];
- nr.forEach((r,y)=>r.forEach((v,x)=>{if(v&&fr[y][x]!==y)mv.push({x,from:fr[y][x],to:y,c:v,d:fr[y][x]-y})}));
- while(nr.length&&nr[nr.length-1].every(v=>!v))nr.pop();
- lines+=flash.length;score+=flash.length*100;document.getElementById("sc").textContent=score;rows=nr;flash=null;
- if(mv.length){const md=Math.max(...mv.map(c=>c.d));
-  anim={cells:mv,t:0,T:Math.sqrt(2*md/A)+.08,set:new Set(mv.map(c=>c.x+","+c.to))};phase="fall"}else check()}
-function step(){if(!p)return;if(hit(p.m,p.x,p.y-1))lock();else p.y--}
-function hard(){if(!p)return;while(!hit(p.m,p.x,p.y-1))p.y--;lock()}
-function draw(dt){
- const tg=Math.max(VR,rows.length+GAP+4);cam+=(tg-cam)*(1-Math.exp(-dt/1000*3));
- g.clearRect(0,0,cell*W,cell*VR);
- const top=cam,bot=top-VR,css=getComputedStyle(document.documentElement);
- g.strokeStyle=css.getPropertyValue("--line");g.lineWidth=1;g.globalAlpha=.5;
- for(let x=1;x<W;x++){g.beginPath();g.moveTo(x*cell,0);g.lineTo(x*cell,cell*VR);g.stroke()}
- g.globalAlpha=1;
- const Y=y=>(top-y-1)*cell;
- const box=(x,y,c)=>{g.fillStyle=COL[Math.abs(c)-1];g.fillRect(x*cell+1,Y(y)+1,cell-2,cell-2)};
- for(let y=Math.max(0,Math.floor(bot)-1);y<=Math.ceil(top)&&y<rows.length;y++)for(let x=0;x<W;x++)
-  if(rows[y][x]&&!(anim&&anim.set.has(x+","+y)))box(x,y,rows[y][x]);
- if(anim)for(const c of anim.cells)box(c.x,c.from-Math.min(c.d,.5*A*anim.t*anim.t),c.c);
- if(p){const off=hit(p.m,p.x,p.y-1)?0:Math.min(.95,acc),m=p.m;
-  for(let r=0;r<m.length;r++)for(let c=0;c<m.length;c++)if(m[r][c])box(p.x+c,p.y-r-off,p.i+1)}
- if(flash){const k=.5+.5*Math.sin(ft*28);
-  for(const y of flash){g.fillStyle="rgba(255,255,255,"+(.35+.5*k)+")";g.fillRect(0,Y(y),cell*W,cell);
-   g.strokeStyle="#ffd23f";g.lineWidth=2;g.strokeRect(1,Y(y)+1,cell*W-2,cell-2)}
-  const my=flash.reduce((a,b)=>a+b,0)/flash.length;
-  const lb=[];if(flash.length>=2)lb.push([flash.length+"ライン!","#ffd23f"]);if(cc>=2)lb.push([cc+"コンボ!","#ff7ac8"]);
-  g.font="bold "+Math.round(cell*1.2)+"px sans-serif";g.textAlign="center";g.textBaseline="middle";g.lineWidth=4;g.strokeStyle="#1d2430";
-  lb.forEach(([t,col],i)=>{const yy=Math.max(cell,Math.min(cell*VR-cell,Y(my)+cell/2-i*cell*1.5));
-   g.fillStyle=col;g.strokeText(t,cell*W/2,yy);g.fillText(t,cell*W/2,yy)})}
- if(bot<0.5){g.fillStyle=css.getPropertyValue("--fg");g.fillRect(0,Y(0)+cell-2,cell*W,3)}
-}
-function loop(t){const dt=Math.min(100,t-last);last=t;
- spd+=((soft?V1:V0)-spd)*(1-Math.exp(-dt/1000*7));
- if(phase==="play"&&p){if(hit(p.m,p.x,p.y-1)){acc=0;lt+=dt/1000;if(lt>=(soft?.12:.45)){lt=0;lock()}}
-  else{lt=0;acc+=spd*dt/1000;while(acc>=1&&p){acc-=1;if(hit(p.m,p.x,p.y-1)){acc=0;break}p.y--}}}
- else if(phase==="flash"){ft+=dt/1000;if(ft>=.55)collapse()}
- else if(phase==="fall"){anim.t+=dt/1000;if(anim.t>=anim.T){anim=null;check()}}
- draw(dt);requestAnimationFrame(loop)}
-const act={L:()=>move(-1),R:()=>move(1),ROT:rot,HD:hard};
-addEventListener("keydown",e=>{const k={ArrowLeft:"L",ArrowRight:"R",ArrowUp:"ROT"," ":"HD"}[e.key];
- if(k){e.preventDefault();act[k]()}if(e.key==="ArrowDown"){e.preventDefault();soft=true}});
-addEventListener("keyup",e=>{if(e.key==="ArrowDown")soft=false});
-let G=null;
-addEventListener("pointerdown",e=>{clearTimeout(G&&G.h);G={x:e.clientX,y:e.clientY,sx:e.clientX,t:performance.now(),moved:false};
- G.h=setTimeout(()=>{if(G&&!G.moved)soft=true},500)});
-addEventListener("pointermove",e=>{if(!G)return;
- if(Math.abs(e.clientX-G.x)>12||Math.abs(e.clientY-G.y)>12)G.moved=true;
- while(e.clientX-G.sx>=cell){G.sx+=cell;move(1)}
- while(G.sx-e.clientX>=cell){G.sx-=cell;move(-1)}});
-function end(){if(!G)return;clearTimeout(G.h);if(!G.moved&&!soft&&performance.now()-G.t<300)rot();soft=false;G=null}
-addEventListener("pointerup",end);addEventListener("pointercancel",end);
-spawn();cam=p.y+4;requestAnimationFrame(t=>{last=t;loop(t)});
-</script>
-</body>
-</html>
+let cell,rows=[],p=null,cam=VR,lines=0,score=0,lt=0,spd=V0,acc=0,last=0,soft=false,phase="play",flash
